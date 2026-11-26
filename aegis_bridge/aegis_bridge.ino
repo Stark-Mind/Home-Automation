@@ -1,19 +1,74 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <WebServer.h>
 #include <ArduinoJson.h>
 
-// 1. Hardware Pin Definitions (Based on your circuit diagram)
+// 1. Hardware Pin Definitions
 #define MAIN_LIGHT_PIN 23  // Red LED
 #define LEFT_LIGHT_PIN 22  // Green LED
 
 // 2. Network Configuration
-const char* ssid = "DESKTOP-46EK6B5 2554";           // Replace with your Wi-Fi name
-const char* password = "6jY1979/";   // Replace with your Wi-Fi password
-const char* serverUrl = "http://192.168.22.177:5000/aegis"; // Your Python Flask Bridge
+const char* ssid = "DESKTOP-46EK6B5 2554";
+const char* password = "6jY1979/";
+const char* bridgeBaseUrl = "http://192.168.137.1:5000";
 
 // 3. Telemetry State Tracking
 bool mainLightState = false;
 bool leftLightState = false;
+
+// 4. Local HTTP Server for Instant Voice Push Commands
+WebServer espServer(80);
+unsigned long lastHeartbeat = 0;
+const unsigned long HEARTBEAT_INTERVAL = 30000; // 30 seconds
+
+void registerWithBridge() {
+    if (WiFi.status() != WL_CONNECTED) return;
+
+    HTTPClient http;
+    http.begin(String(bridgeBaseUrl) + "/register");
+    http.setTimeout(3000);
+    http.addHeader("Content-Type", "application/json");
+
+    StaticJsonDocument<256> doc;
+    doc["ip"] = WiFi.localIP().toString();
+    JsonObject telemetry = doc.createNestedObject("telemetry");
+    telemetry["main_light"] = mainLightState;
+    telemetry["left_light"] = leftLightState;
+
+    String payload;
+    serializeJson(doc, payload);
+    http.POST(payload);
+    http.end();
+}
+
+void handlePushExecute() {
+    if (!espServer.hasArg("plain")) {
+        espServer.send(400, "application/json", "{\"error\":\"missing body\"}");
+        return;
+    }
+
+    String body = espServer.arg("plain");
+    Serial.println("\n[VOICE PUSH]: " + body);
+
+    StaticJsonDocument<256> commandDoc;
+    DeserializationError error = deserializeJson(commandDoc, body);
+
+    if (!error) {
+        String targetDevice = commandDoc["device"];
+        String targetState = commandDoc["state"];
+        executeHardwareAction(targetDevice, targetState);
+
+        // Return ground-truth GPIO states back to Python bridge
+        StaticJsonDocument<128> respDoc;
+        respDoc["main_light"] = mainLightState;
+        respDoc["left_light"] = leftLightState;
+        String respJson;
+        serializeJson(respDoc, respJson);
+        espServer.send(200, "application/json", respJson);
+    } else {
+        espServer.send(400, "application/json", "{\"error\":\"invalid json\"}");
+    }
+}
 
 void setup() {
     Serial.begin(115200);
@@ -22,32 +77,45 @@ void setup() {
     // Initialize Motor Cortex Pins
     pinMode(MAIN_LIGHT_PIN, OUTPUT);
     pinMode(LEFT_LIGHT_PIN, OUTPUT);
-    
-    // Set initial state to OFF
     digitalWrite(MAIN_LIGHT_PIN, LOW);
     digitalWrite(LEFT_LIGHT_PIN, LOW);
 
     // Connect to Wi-Fi
-    Serial.println();
-    Serial.print("Connecting to Wi-Fi");
+    Serial.print("\nConnecting to Wi-Fi");
     WiFi.begin(ssid, password);
-    
     while (WiFi.status() != WL_CONNECTED) {
         delay(500);
         Serial.print(".");
     }
-    
-    Serial.println("\nWi-Fi Connected!");
-    Serial.println("A.E.G.I.S. Motor Cortex Ready.");
-    Serial.println("Type a command (e.g., 'andhera ho gaya hai') and press Enter:");
+
+    Serial.println("\nWi-Fi Connected! IP: " + WiFi.localIP().toString());
+
+    // Start local listener for voice commands pushed from PC
+    espServer.on("/execute", HTTP_POST, handlePushExecute);
+    espServer.begin();
+
+    // Register IP and initial states with Python bridge
+    registerWithBridge();
+    lastHeartbeat = millis();
+
+    Serial.println("A.E.G.I.S. Dual-Mode Cortex Ready (Voice Push + Serial Text).");
 }
 
 void loop() {
-    // Listen for commands typed into the Serial Monitor
+    // 1. Handle incoming voice commands pushed from PC
+    espServer.handleClient();
+
+    // 2. Keep ESP32 IP registered with Python bridge
+    if (millis() - lastHeartbeat >= HEARTBEAT_INTERVAL) {
+        registerWithBridge();
+        lastHeartbeat = millis();
+    }
+
+    // 3. Preserve Serial Monitor text input
     if (Serial.available() > 0) {
         String userInput = Serial.readStringUntil('\n');
         userInput.trim();
-        
+
         if (userInput.length() > 0) {
             Serial.println("\n[USER]: " + userInput);
             sendToAegis(userInput);
@@ -58,14 +126,10 @@ void loop() {
 void sendToAegis(String userInput) {
     if (WiFi.status() == WL_CONNECTED) {
         HTTPClient http;
-        http.begin(serverUrl);
-        
-        // Give A.E.G.I.S. up to 15 seconds to "think" and reply
-        http.setTimeout(15000); 
-        
+        http.begin(String(bridgeBaseUrl) + "/aegis");
+        http.setTimeout(15000);
         http.addHeader("Content-Type", "application/json");
 
-        // Step 1: Pack the current ESP32 telemetry into JSON
         StaticJsonDocument<256> doc;
         JsonObject telemetry = doc.createNestedObject("telemetry");
         telemetry["main_light"] = mainLightState;
@@ -75,28 +139,22 @@ void sendToAegis(String userInput) {
         String requestBody;
         serializeJson(doc, requestBody);
 
-        // Step 2: Fire the POST request to the local Python Bridge
         int httpResponseCode = http.POST(requestBody);
-        
+
         if (httpResponseCode > 0) {
             String response = http.getString();
             Serial.println("[A.E.G.I.S. RAW]: " + response);
-            
-            // Step 3: Parse the outer JSON from Flask
+
             StaticJsonDocument<512> responseDoc;
             DeserializationError error = deserializeJson(responseDoc, response);
-            
+
             if (!error) {
                 String rawCommand = responseDoc["command"];
-                
-                // Step 4: Parse the inner JSON generated by Ollama
                 StaticJsonDocument<256> commandDoc;
                 deserializeJson(commandDoc, rawCommand);
-                
+
                 String targetDevice = commandDoc["device"];
                 String targetState = commandDoc["state"];
-                
-                // Step 5: Execute Needle 3 Hardware Logic
                 executeHardwareAction(targetDevice, targetState);
             } else {
                 Serial.println("Failed to parse A.E.G.I.S. wrapper JSON.");
@@ -118,22 +176,22 @@ void executeHardwareAction(String device, String state) {
         mainLightState = turnOn;
         digitalWrite(MAIN_LIGHT_PIN, turnOn ? HIGH : LOW);
         Serial.println(turnOn ? "[ACTION]: Main Light (Red LED) -> ON" : "[ACTION]: Main Light (Red LED) -> OFF");
-    } 
+    }
     else if (device == "left_light") {
         leftLightState = turnOn;
         digitalWrite(LEFT_LIGHT_PIN, turnOn ? HIGH : LOW);
         Serial.println(turnOn ? "[ACTION]: Left Light (Green LED) -> ON" : "[ACTION]: Left Light (Green LED) -> OFF");
-    } 
+    }
     else if (device == "both") {
         mainLightState = turnOn;
         leftLightState = turnOn;
         digitalWrite(MAIN_LIGHT_PIN, turnOn ? HIGH : LOW);
         digitalWrite(LEFT_LIGHT_PIN, turnOn ? HIGH : LOW);
         Serial.println(turnOn ? "[ACTION]: Both Lights -> ON" : "[ACTION]: Both Lights -> OFF");
-    } 
+    }
     else {
         Serial.println("[ACTION]: None required or invalid device.");
     }
-    
+
     Serial.println("Awaiting next command...");
 }
